@@ -2,7 +2,7 @@
 //! process of matching, placeholder values are recorded.
 
 use crate::{
-    parsing::{Constraint, NodeKind, Placeholder, Var},
+    parsing::{Constraint, NodeKind, Placeholder, TypeConstraint, Var},
     resolving::{ResolvedPattern, ResolvedRule, UfcsCallInfo},
     SsrMatches,
 };
@@ -175,7 +175,11 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
         // Handle placeholders.
         if let Some(placeholder) = self.get_placeholder_for_node(pattern) {
             for constraint in &placeholder.constraints {
-                self.check_constraint(constraint, code)?;
+                // We check only cheap constraints on the first pass and only expensive constraints
+                // on the second pass.
+                if matches!(phase, Phase::Second(_)) == constraint.is_expensive() {
+                    self.check_constraint(phase, constraint, code)?;
+                }
             }
             if let Phase::Second(matches_out) = phase {
                 let original_range = self.sema.original_range(code);
@@ -315,15 +319,19 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
 
     fn check_constraint(
         &self,
+        phase: &mut Phase,
         constraint: &Constraint,
         code: &SyntaxNode,
     ) -> Result<(), MatchFailed> {
         match constraint {
+            Constraint::Type(required_type) => {
+                self.attempt_match_type(phase, required_type, self.node_type(code)?)?
+            }
             Constraint::Kind(kind) => {
                 kind.matches(code)?;
             }
             Constraint::Not(sub) => {
-                if self.check_constraint(&*sub, code).is_ok() {
+                if self.check_constraint(phase, &*sub, code).is_ok() {
                     fail_match!("Constraint {:?} failed for '{}'", constraint, code.text());
                 }
             }
@@ -386,6 +394,69 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
             (None, Some(c)) => {
                 fail_match!("Nothing in pattern to match code `{}`", c.syntax().text())
             }
+        }
+    }
+
+    fn attempt_match_type(
+        &self,
+        phase: &mut Phase,
+        required: &TypeConstraint,
+        actual: hir::Type,
+    ) -> Result<(), MatchFailed> {
+        match required {
+            TypeConstraint::Path(path) => {
+                if let Some(actual_adt) = actual.as_adt() {
+                    self.attempt_match_adt_path(phase, &path, &actual_adt)?;
+                } else {
+                    fail_match!("Type isn't an ADT");
+                }
+            }
+            TypeConstraint::BuiltIn(_builtin) => fail_match!("No idea how to implement this"),
+        }
+        Ok(())
+    }
+
+    fn attempt_match_adt_path(
+        &self,
+        phase: &Phase,
+        required: &ast::Path,
+        actual_adt: &hir::Adt,
+    ) -> Result<(), MatchFailed> {
+        let file_id = if let Phase::Second(m) = phase {
+            m.range.file_id
+        } else {
+            return Ok(());
+        };
+        let file = self.sema.parse(file_id);
+        let scope = self.sema.scope(file.syntax());
+        let resolved = scope
+            .speculative_resolve(required)
+            .ok_or_else(|| match_error!("Failed to resolve path `{}`", required.syntax().text()))?;
+        if let hir::PathResolution::Def(hir::ModuleDef::Adt(required_adt)) = resolved {
+            mark::hit!(match_resolved_pat_type);
+            if required_adt != *actual_adt {
+                fail_match!("Placeholder type constraint didn't match");
+            }
+        } else {
+            fail_match!(
+                "Type constraint path `{}` didn't resolve to an ADT",
+                required.syntax().text()
+            );
+        }
+        Ok(())
+    }
+
+    fn node_type(&self, code: &SyntaxNode) -> Result<hir::Type, MatchFailed> {
+        if let Some(expr) = ast::Expr::cast(code.clone()) {
+            self.sema.type_of_expr(&expr).ok_or_else(|| {
+                match_error!("Couldn't get expression type for code `{}`", code.text())
+            })
+        } else if let Some(pat) = ast::Pat::cast(code.clone()) {
+            self.sema
+                .type_of_pat(&pat)
+                .ok_or_else(|| match_error!("Couldn't get pat type for code `{}`", code.text()))
+        } else {
+            fail_match!("Placeholder requested type of unsupported node {:?}", code.kind())
         }
     }
 
@@ -753,6 +824,18 @@ fn only_ident(element: SyntaxElement) -> Option<SyntaxToken> {
         }
     }
     None
+}
+
+impl Constraint {
+    /// Returns whether checking this constraint might be expensive. Such constraints will only be
+    /// checked on the second pass of the pattern once everything else has been confirmed to match.
+    fn is_expensive(&self) -> bool {
+        match self {
+            Constraint::Type(_) => true,
+            Constraint::Kind(_) => false,
+            Constraint::Not(sub) => sub.is_expensive(),
+        }
+    }
 }
 
 struct PatternIterator {

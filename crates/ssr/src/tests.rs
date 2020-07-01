@@ -1279,3 +1279,55 @@ fn replace_autoref_mut() {
         "#]],
     );
 }
+
+#[test]
+fn match_resolved_pat_type() {
+    mark::check!(match_resolved_pat_type);
+    let code = r#"
+        //- /lib.rs crate:foo
+        mod m1 {
+            pub mod m2 {
+                pub enum Animal {Cat, Dog(i32)}
+            }
+        }
+        mod m3 {
+            pub enum Animal {Cat, Dog(i32)}
+            fn f1(a1: Animal) {
+                if let Animal::Dog(5) = a1 {}
+            }
+        }
+        mod m4 {
+            use crate::m1::m2::Animal;
+            fn f1(a2: Animal) {
+                if let Animal::Dog(42) = a2 {}
+            }
+        }
+        "#;
+    // The matches are all from m4, since the more or less identical code in m3 has a different
+    // Animal type. We match the function argument `a2`, the destructuring pattern and the variable
+    // reference.
+    assert_matches("${a:type(crate::m1::m2::Animal)}", code, &["a2", "Animal::Dog(42)", "a2"]);
+}
+
+#[test]
+fn expression_type_constraints() {
+    let code = r#"
+        mod m1 {
+            pub mod m2 {
+                #[derive(Clone)]
+                struct Foo {}
+            }
+            fn f1() -> m2::Foo {
+                m2::Foo {}
+            }
+        }
+        fn f2() {
+            String::new().clone();
+            true.clone();
+            m1::f1().clone();
+        }
+        "#;
+    assert_matches("${a:type(m1::m2::Foo)}.clone()", code, &["m1::f1().clone()"]);
+    assert_no_match("${a:type(m1::m2::Bar)}.clone()", code);
+    assert_matches("${a:type(bool)}.clone()", code, &["true.clone()"]);
+}

@@ -46,8 +46,15 @@ pub(crate) struct Var(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Constraint {
+    Type(TypeConstraint),
     Kind(NodeKind),
     Not(Box<Constraint>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TypeConstraint {
+    BuiltIn(hir::BuiltinType),
+    Path(ast::Path),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,6 +313,15 @@ fn parse_constraint(tokens: &mut std::vec::IntoIter<Token>) -> Result<Constraint
         .text
         .to_string();
     match constraint_type.as_str() {
+        "type" => {
+            expect_token(tokens, "(")?;
+            let contents = up_to_closing_parenthesis(tokens)?;
+            if let Ok(type_ref) = ast::Type::parse(&contents) {
+                Ok(Constraint::Type(TypeConstraint::from_type_ref(&type_ref)?))
+            } else {
+                bail!("Couldn't parse `{}` as a type reference", contents);
+            }
+        }
         "kind" => {
             expect_token(tokens, "(")?;
             let t = tokens.next().ok_or_else(|| {
@@ -324,6 +340,53 @@ fn parse_constraint(tokens: &mut std::vec::IntoIter<Token>) -> Result<Constraint
             Ok(Constraint::Not(Box::new(sub)))
         }
         x => bail!("Unsupported constraint type '{}'", x),
+    }
+}
+
+/// Returns everything up until a matching closing parenthesis as a string.
+fn up_to_closing_parenthesis(tokens: &mut std::vec::IntoIter<Token>) -> Result<String, SsrError> {
+    let mut res = String::new();
+    let mut paren_depth = 0;
+    loop {
+        let token = tokens.next().ok_or_else(|| {
+            SsrError::new("Unexpected end of constraint while looking for closing ')'")
+        })?;
+        if token.kind == SyntaxKind::R_PAREN {
+            if paren_depth == 0 {
+                break;
+            }
+            paren_depth -= 1;
+        } else if token.kind == SyntaxKind::L_PAREN {
+            paren_depth += 1;
+        }
+        res.push_str(&token.text);
+    }
+    Ok(res)
+}
+
+impl TypeConstraint {
+    fn from_type_ref(ty: &ast::Type) -> Result<Self, SsrError> {
+        match ty {
+            ast::Type::PathType(path_type) => {
+                if let Some(path) = path_type.path() {
+                    if path.parent_path().is_none() {
+                        if let Some(segment) = path.segment() {
+                            if let Some(name_ref) = segment.name_ref() {
+                                for (builtin_name, builtin) in hir::BuiltinType::ALL {
+                                    if builtin_name.to_string() == name_ref.text().as_str() {
+                                        return Ok(TypeConstraint::BuiltIn(builtin.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(TypeConstraint::Path(path));
+                } else {
+                    bail!("Invalid PathType");
+                }
+            }
+            _ => bail!("Unsupported type in type constraint"),
+        }
     }
 }
 

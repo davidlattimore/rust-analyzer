@@ -36,6 +36,7 @@
 // |===
 // | Constraint    | Restricts placeholder
 //
+// | type(a::b)    | Has a type that resolves to a::b (including crate name).
 // | kind(literal) | Is a literal (e.g. `42` or `"forty two"`)
 // | not(a)        | Negates the constraint `a`
 // |===
