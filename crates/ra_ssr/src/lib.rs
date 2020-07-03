@@ -6,18 +6,21 @@
 mod matching;
 mod parsing;
 mod replacing;
+mod resolution;
 #[macro_use]
 mod errors;
 #[cfg(test)]
 mod tests;
 
+use crate::errors::bail;
 pub use crate::errors::SsrError;
 pub use crate::matching::Match;
 use crate::matching::{record_match_fails_reasons_scope, MatchFailureReason};
 use hir::Semantics;
-use ra_db::{FileId, FileRange};
+use ra_db::{FileId, FilePosition, FileRange};
 use ra_syntax::{ast, AstNode, SmolStr, SyntaxKind, SyntaxNode, TextRange};
 use ra_text_edit::TextEdit;
+use resolution::ResolvedRule;
 use rustc_hash::FxHashMap;
 
 // A structured search replace rule. Create by calling `parse` on a str.
@@ -53,21 +56,63 @@ pub struct SsrMatches {
 pub struct MatchFinder<'db> {
     /// Our source of information about the user's code.
     sema: Semantics<'db, ra_ide_db::RootDatabase>,
-    rules: Vec<SsrRule>,
+    rules: Vec<ResolvedRule>,
+    scope: hir::SemanticsScope<'db>,
+    hygiene: hir::Hygiene,
 }
 
 impl<'db> MatchFinder<'db> {
-    pub fn new(db: &'db ra_ide_db::RootDatabase) -> MatchFinder<'db> {
-        MatchFinder { sema: Semantics::new(db), rules: Vec::new() }
+    /// Constructs a new instance where names will be looked up as if they appeared at
+    /// `lookup_context`.
+    pub fn in_context(
+        db: &'db ra_ide_db::RootDatabase,
+        lookup_context: FilePosition,
+    ) -> MatchFinder<'db> {
+        let sema = Semantics::new(db);
+        let file = sema.parse(lookup_context.file_id);
+        // Find a node at the requested position, falling back to the whole file.
+        let node = file
+            .syntax()
+            .token_at_offset(lookup_context.offset)
+            .left_biased()
+            .map(|token| token.parent())
+            .unwrap_or_else(|| file.syntax().clone());
+        let scope = sema.scope(&node);
+        MatchFinder {
+            sema: Semantics::new(db),
+            rules: Vec::new(),
+            scope,
+            hygiene: hir::Hygiene::new(db, lookup_context.file_id.into()),
+        }
     }
 
-    pub fn add_rule(&mut self, rule: SsrRule) {
-        self.rules.push(rule);
+    /// Constructs an instance using the start of the first file in `db` as the lookup context.
+    pub fn at_first_file(db: &'db ra_ide_db::RootDatabase) -> Result<MatchFinder<'db>, SsrError> {
+        use ra_db::SourceDatabaseExt;
+        use ra_ide_db::symbol_index::SymbolsDatabase;
+        if let Some(first_file_id) = db
+            .local_roots()
+            .iter()
+            .next()
+            .and_then(|root| db.source_root(root.clone()).iter().next())
+        {
+            Ok(MatchFinder::in_context(
+                db,
+                FilePosition { file_id: first_file_id, offset: 0.into() },
+            ))
+        } else {
+            bail!("No files to search");
+        }
+    }
+
+    pub fn add_rule(&mut self, rule: SsrRule) -> Result<(), SsrError> {
+        self.rules.push(ResolvedRule::new(rule, &self.scope, &self.hygiene)?);
+        Ok(())
     }
 
     /// Adds a search pattern. For use if you intend to only call `find_matches_in_file`. If you
     /// intend to do replacement, use `add_rule` instead.
-    pub fn add_search_pattern(&mut self, pattern: SsrPattern) {
+    pub fn add_search_pattern(&mut self, pattern: SsrPattern) -> Result<(), SsrError> {
         self.add_rule(SsrRule { pattern, template: "()".parse().unwrap() })
     }
 

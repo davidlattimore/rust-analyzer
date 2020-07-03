@@ -3,7 +3,8 @@
 
 use crate::{
     parsing::{Constraint, NodeKind, Placeholder, SsrTemplate},
-    SsrMatches, SsrPattern, SsrRule,
+    resolution::ResolvedRule,
+    SsrMatches, SsrPattern,
 };
 use hir::Semantics;
 use ra_db::FileRange;
@@ -86,7 +87,7 @@ pub(crate) struct MatchFailed {
 /// parent module, we don't populate nested matches.
 pub(crate) fn get_match(
     debug_active: bool,
-    rule: &SsrRule,
+    rule: &ResolvedRule,
     code: &SyntaxNode,
     restrict_range: &Option<FileRange>,
     sema: &Semantics<ra_ide_db::RootDatabase>,
@@ -102,7 +103,7 @@ struct Matcher<'db, 'sema> {
     /// If any placeholders come from anywhere outside of this range, then the match will be
     /// rejected.
     restrict_range: Option<FileRange>,
-    rule: &'sema SsrRule,
+    rule: &'sema ResolvedRule,
 }
 
 /// Which phase of matching we're currently performing. We do two phases because most attempted
@@ -117,7 +118,7 @@ enum Phase<'a> {
 
 impl<'db, 'sema> Matcher<'db, 'sema> {
     fn try_match(
-        rule: &'sema SsrRule,
+        rule: &'sema ResolvedRule,
         code: &SyntaxNode,
         restrict_range: &Option<FileRange>,
         sema: &'sema Semantics<'db, ra_ide_db::RootDatabase>,
@@ -194,6 +195,7 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
                 self.attempt_match_record_field_list(phase, pattern, code)
             }
             SyntaxKind::TOKEN_TREE => self.attempt_match_token_tree(phase, pattern, code),
+            SyntaxKind::PATH => self.attempt_match_path(phase, pattern, code),
             _ => self.attempt_match_node_children(phase, pattern, code),
         }
     }
@@ -308,6 +310,64 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
             }
         }
         Ok(())
+    }
+
+    /// We want to allow fully-qualified paths to match non-fully-qualified paths that resolve to
+    /// the same thing.
+    fn attempt_match_path(
+        &self,
+        phase: &mut Phase,
+        pattern: &SyntaxNode,
+        code: &SyntaxNode,
+    ) -> Result<(), MatchFailed> {
+        if let Some(pattern_resolved) = self.rule.resolved_paths.get(pattern) {
+            let pattern_path = ast::Path::cast(pattern.clone()).unwrap();
+            let code_path = ast::Path::cast(code.clone()).unwrap();
+            if let (Some(pattern_segment), Some(code_segment)) =
+                (pattern_path.segment(), code_path.segment())
+            {
+                // Match everything within the segment except for the name-ref, which is handled
+                // separately via comparing what the path resolves to below.
+                self.attempt_match_opt(
+                    phase,
+                    pattern_segment.type_arg_list(),
+                    code_segment.type_arg_list(),
+                )?;
+                self.attempt_match_opt(
+                    phase,
+                    pattern_segment.param_list(),
+                    code_segment.param_list(),
+                )?;
+            }
+            if matches!(phase, Phase::Second(_)) {
+                let resolution = self
+                    .sema
+                    .resolve_path(&code_path)
+                    .ok_or_else(|| match_error!("Failed to resolve path `{}`", code.text()))?;
+                if *pattern_resolved != resolution {
+                    fail_match!("Pattern had path `{}` code had `{}`", pattern.text(), code.text());
+                }
+            }
+        } else {
+            return self.attempt_match_node_children(phase, pattern, code);
+        }
+        Ok(())
+    }
+
+    fn attempt_match_opt<T: AstNode>(
+        &self,
+        phase: &mut Phase,
+        pattern: Option<T>,
+        code: Option<T>,
+    ) -> Result<(), MatchFailed> {
+        match (pattern, code) {
+            (Some(p), Some(c)) => self.attempt_match_node(phase, &p.syntax(), &c.syntax()),
+            (None, None) => Ok(()),
+            (Some(p), None) => fail_match!("Pattern `{}` had nothing to match", p.syntax().text()),
+            (None, Some(c)) => {
+                fail_match!("Nothing in pattern to match code `{}`", c.syntax().text())
+            }
+        }
     }
 
     /// We want to allow the records to match in any order, so we have special matching logic for
@@ -592,6 +652,7 @@ impl PatternIterator {
 mod tests {
     use super::*;
     use crate::{MatchFinder, SsrRule};
+    use ra_db::FilePosition;
 
     #[test]
     fn parse_match_replace() {
@@ -600,8 +661,9 @@ mod tests {
 
         use ra_db::fixture::WithFixture;
         let (db, file_id) = ra_ide_db::RootDatabase::with_single_file(input);
-        let mut match_finder = MatchFinder::new(&db);
-        match_finder.add_rule(rule);
+        let mut match_finder =
+            MatchFinder::in_context(&db, FilePosition { file_id, offset: 0.into() });
+        match_finder.add_rule(rule).unwrap();
         let matches = match_finder.find_matches_in_file(file_id);
         assert_eq!(matches.matches.len(), 1);
         assert_eq!(matches.matches[0].matched_node.text(), "foo(1+2)");
