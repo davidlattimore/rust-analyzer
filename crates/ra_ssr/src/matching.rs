@@ -2,9 +2,9 @@
 //! process of matching, placeholder values are recorded.
 
 use crate::{
-    parsing::{Constraint, NodeKind, Placeholder, SsrTemplate},
-    resolution::ResolvedRule,
-    SsrMatches, SsrPattern,
+    parsing::{Constraint, NodeKind, Placeholder},
+    resolving::{ResolvedPattern, ResolvedRule},
+    SsrMatches,
 };
 use hir::Semantics;
 use ra_db::FileRange;
@@ -49,9 +49,11 @@ pub struct Match {
     pub(crate) matched_node: SyntaxNode,
     pub(crate) placeholder_values: FxHashMap<Var, PlaceholderMatch>,
     pub(crate) ignored_comments: Vec<ast::Comment>,
-    // A copy of the template for the rule that produced this match. We store this on the match for
-    // if/when we do replacement.
-    pub(crate) template: SsrTemplate,
+    pub(crate) rule_index: usize,
+    /// The depth of matched_node.
+    pub(crate) depth: usize,
+    // Each path in the template rendered for the module in which the match was found.
+    pub(crate) rendered_template_paths: FxHashMap<SyntaxNode, hir::ModPath>,
 }
 
 /// Represents a `$var` in an SSR query.
@@ -118,26 +120,35 @@ enum Phase<'a> {
 
 impl<'db, 'sema> Matcher<'db, 'sema> {
     fn try_match(
-        rule: &'sema ResolvedRule,
+        rule: &ResolvedRule,
         code: &SyntaxNode,
         restrict_range: &Option<FileRange>,
         sema: &'sema Semantics<'db, ra_ide_db::RootDatabase>,
     ) -> Result<Match, MatchFailed> {
         let match_state = Matcher { sema, restrict_range: restrict_range.clone(), rule };
-        let pattern_tree = rule.pattern.tree_for_kind(code.kind())?;
         // First pass at matching, where we check that node types and idents match.
-        match_state.attempt_match_node(&mut Phase::First, &pattern_tree, code)?;
+        match_state.attempt_match_node(&mut Phase::First, &rule.pattern.node, code)?;
         match_state.validate_range(&sema.original_range(code))?;
         let mut the_match = Match {
             range: sema.original_range(code),
             matched_node: code.clone(),
             placeholder_values: FxHashMap::default(),
             ignored_comments: Vec::new(),
-            template: rule.template.clone(),
+            rule_index: rule.index,
+            depth: 0,
+            rendered_template_paths: FxHashMap::default(),
         };
         // Second matching pass, where we record placeholder matches, ignored comments and maybe do
         // any other more expensive checks that we didn't want to do on the first pass.
-        match_state.attempt_match_node(&mut Phase::Second(&mut the_match), &pattern_tree, code)?;
+        match_state.attempt_match_node(
+            &mut Phase::Second(&mut the_match),
+            &rule.pattern.node,
+            code,
+        )?;
+        the_match.depth = sema.ancestors_with_macros(the_match.matched_node.clone()).count();
+        if let Some(template) = &rule.template {
+            the_match.render_template_paths(template, sema)?;
+        }
         Ok(the_match)
     }
 
@@ -320,7 +331,7 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
         pattern: &SyntaxNode,
         code: &SyntaxNode,
     ) -> Result<(), MatchFailed> {
-        if let Some(pattern_resolved) = self.rule.resolved_paths.get(pattern) {
+        if let Some(pattern_resolved) = self.rule.pattern.resolved_paths.get(pattern) {
             let pattern_path = ast::Path::cast(pattern.clone()).unwrap();
             let code_path = ast::Path::cast(code.clone()).unwrap();
             if let (Some(pattern_segment), Some(code_segment)) =
@@ -344,7 +355,7 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
                     .sema
                     .resolve_path(&code_path)
                     .ok_or_else(|| match_error!("Failed to resolve path `{}`", code.text()))?;
-                if *pattern_resolved != resolution {
+                if pattern_resolved.resolution != resolution {
                     fail_match!("Pattern had path `{}` code had `{}`", pattern.text(), code.text());
                 }
             }
@@ -504,8 +515,29 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
     }
 
     fn get_placeholder(&self, element: &SyntaxElement) -> Option<&Placeholder> {
-        only_ident(element.clone())
-            .and_then(|ident| self.rule.pattern.placeholders_by_stand_in.get(ident.text()))
+        only_ident(element.clone()).and_then(|ident| self.rule.get_placeholder(&ident))
+    }
+}
+
+impl Match {
+    fn render_template_paths(
+        &mut self,
+        template: &ResolvedPattern,
+        sema: &Semantics<ra_ide_db::RootDatabase>,
+    ) -> Result<(), MatchFailed> {
+        let module = sema
+            .scope(&self.matched_node)
+            .module()
+            .ok_or_else(|| match_error!("Matched node isn't in a module"))?;
+        for (path, resolved_path) in &template.resolved_paths {
+            if let hir::PathResolution::Def(module_def) = resolved_path.resolution {
+                let mod_path = module.find_use_path(sema.db, module_def).ok_or_else(|| {
+                    match_error!("Failed to render template path `{}` at match location")
+                })?;
+                self.rendered_template_paths.insert(path.clone(), mod_path);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -570,28 +602,6 @@ impl PlaceholderMatch {
     }
 }
 
-impl SsrPattern {
-    pub(crate) fn tree_for_kind(&self, kind: SyntaxKind) -> Result<&SyntaxNode, MatchFailed> {
-        let (tree, kind_name) = if ast::Expr::can_cast(kind) {
-            (&self.expr, "expression")
-        } else if ast::TypeRef::can_cast(kind) {
-            (&self.type_ref, "type reference")
-        } else if ast::ModuleItem::can_cast(kind) {
-            (&self.item, "item")
-        } else if ast::Path::can_cast(kind) {
-            (&self.path, "path")
-        } else if ast::Pat::can_cast(kind) {
-            (&self.pattern, "pattern")
-        } else {
-            fail_match!("Matching nodes of kind {:?} is not supported", kind);
-        };
-        match tree {
-            Some(tree) => Ok(tree),
-            None => fail_match!("Pattern cannot be parsed as a {}", kind_name),
-        }
-    }
-}
-
 impl NodeKind {
     fn matches(&self, node: &SyntaxNode) -> Result<(), MatchFailed> {
         let ok = match self {
@@ -652,19 +662,16 @@ impl PatternIterator {
 mod tests {
     use super::*;
     use crate::{MatchFinder, SsrRule};
-    use ra_db::FilePosition;
 
     #[test]
     fn parse_match_replace() {
         let rule: SsrRule = "foo($x) ==>> bar($x)".parse().unwrap();
-        let input = "fn foo() {} fn main() { foo(1+2); }";
+        let input = "fn foo() {} fn bar() {} fn main() { foo(1+2); }";
 
-        use ra_db::fixture::WithFixture;
-        let (db, file_id) = ra_ide_db::RootDatabase::with_single_file(input);
-        let mut match_finder =
-            MatchFinder::in_context(&db, FilePosition { file_id, offset: 0.into() });
+        let (db, position) = crate::tests::single_file(input);
+        let mut match_finder = MatchFinder::in_context(&db, position);
         match_finder.add_rule(rule).unwrap();
-        let matches = match_finder.find_matches_in_file(file_id);
+        let matches = match_finder.matches();
         assert_eq!(matches.matches.len(), 1);
         assert_eq!(matches.matches[0].matched_node.text(), "foo(1+2)");
         assert_eq!(matches.matches[0].placeholder_values.len(), 1);
@@ -677,9 +684,11 @@ mod tests {
             "1+2"
         );
 
-        let edit = crate::replacing::matches_to_edit(&matches, input);
+        let edits = match_finder.edits();
+        assert_eq!(edits.len(), 1);
+        let edit = &edits[0];
         let mut after = input.to_string();
-        edit.apply(&mut after);
-        assert_eq!(after, "fn foo() {} fn main() { bar(1+2); }");
+        edit.edit.apply(&mut after);
+        assert_eq!(after, "fn foo() {} fn bar() {} fn main() { bar(1+2); }");
     }
 }
