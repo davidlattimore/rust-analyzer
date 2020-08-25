@@ -751,6 +751,12 @@ impl<'a> SemanticsScope<'a> {
         let path = Path::from_src(path.clone(), &hygiene)?;
         resolve_hir_path(self.db, &self.resolver, &path)
     }
+
+    pub fn speculative_resolve_type(&self, _ty: &ast::Type) -> Option<Type> {
+        // I think this might be implemented via TypeRef::from_ast then Ty::from_hir or something
+        // like that.
+        todo!();
+    }
 }
 
 // FIXME: Change `HasSource` trait to work with `Semantics` and remove this?

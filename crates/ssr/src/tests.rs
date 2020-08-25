@@ -1331,3 +1331,24 @@ fn expression_type_constraints() {
     assert_no_match("${a:type(m1::m2::Bar)}.clone()", code);
     assert_matches("${a:type(bool)}.clone()", code, &["true.clone()"]);
 }
+
+#[test]
+fn builtin_type_constraints() {
+    let code = r#"
+        fn f2(a: i32, b: bool, c: i64) -> i32 {
+            let v = if b {
+                a + 1
+            } else {
+                c as i32 + 2
+            };
+            let v2 = if b {
+                a as i64 + 3
+            } else {
+                c + 4
+            };
+        }
+        "#;
+    assert_matches("${a:type(i32)} + $b", code, &["a + 1", "c as i32 + 2"]);
+    assert_matches("${a:type(i64)} + $b", code, &["a as i64 + 3", "c + 4"]);
+    assert_no_match("${a:type(u64)} + $b", code);
+}

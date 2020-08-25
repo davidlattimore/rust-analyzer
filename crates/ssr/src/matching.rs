@@ -2,7 +2,7 @@
 //! process of matching, placeholder values are recorded.
 
 use crate::{
-    parsing::{Constraint, NodeKind, Placeholder, TypeConstraint, Var},
+    parsing::{Constraint, NodeKind, Placeholder, Var},
     resolving::{ResolvedPattern, ResolvedRule, UfcsCallInfo},
     SsrMatches,
 };
@@ -324,7 +324,8 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
         code: &SyntaxNode,
     ) -> Result<(), MatchFailed> {
         match constraint {
-            Constraint::Type(required_type) => {
+            Constraint::Type(_) => unreachable!(),
+            Constraint::ResolvedType(required_type) => {
                 self.attempt_match_type(phase, required_type, self.node_type(code)?)?
             }
             Constraint::Kind(kind) => {
@@ -399,49 +400,17 @@ impl<'db, 'sema> Matcher<'db, 'sema> {
 
     fn attempt_match_type(
         &self,
-        phase: &mut Phase,
-        required: &TypeConstraint,
+        _phase: &mut Phase,
+        required: &ast::Type,
         actual: hir::Type,
     ) -> Result<(), MatchFailed> {
-        match required {
-            TypeConstraint::Path(path) => {
-                if let Some(actual_adt) = actual.as_adt() {
-                    self.attempt_match_adt_path(phase, &path, &actual_adt)?;
-                } else {
-                    fail_match!("Type isn't an ADT");
-                }
-            }
-            TypeConstraint::BuiltIn(_builtin) => fail_match!("No idea how to implement this"),
-        }
-        Ok(())
-    }
-
-    fn attempt_match_adt_path(
-        &self,
-        phase: &Phase,
-        required: &ast::Path,
-        actual_adt: &hir::Adt,
-    ) -> Result<(), MatchFailed> {
-        let file_id = if let Phase::Second(m) = phase {
-            m.range.file_id
-        } else {
-            return Ok(());
-        };
-        let file = self.sema.parse(file_id);
-        let scope = self.sema.scope(file.syntax());
-        let resolved = scope
-            .speculative_resolve(required)
-            .ok_or_else(|| match_error!("Failed to resolve path `{}`", required.syntax().text()))?;
-        if let hir::PathResolution::Def(hir::ModuleDef::Adt(required_adt)) = resolved {
-            mark::hit!(match_resolved_pat_type);
-            if required_adt != *actual_adt {
-                fail_match!("Placeholder type constraint didn't match");
-            }
-        } else {
-            fail_match!(
-                "Type constraint path `{}` didn't resolve to an ADT",
-                required.syntax().text()
-            );
+        use hir::HirDisplay;
+        // TODO: Once we've succesfully resolved the type in resolving.rs, `required` will be a
+        // `hir::Type` instead of an `ast::Type`. Right now, we do a very hacky string comparison.
+        let actual_source = actual.display(self.sema.db).to_string();
+        let required_source = required.syntax().text().to_string();
+        if actual_source != required_source {
+            fail_match!("Expected type `{}`, got `{}`", required_source, actual_source);
         }
         Ok(())
     }
@@ -832,6 +801,7 @@ impl Constraint {
     fn is_expensive(&self) -> bool {
         match self {
             Constraint::Type(_) => true,
+            Constraint::ResolvedType(_) => true,
             Constraint::Kind(_) => false,
             Constraint::Not(sub) => sub.is_expensive(),
         }

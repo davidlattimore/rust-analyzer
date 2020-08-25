@@ -46,15 +46,16 @@ pub(crate) struct Var(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Constraint {
-    Type(TypeConstraint),
     Kind(NodeKind),
     Not(Box<Constraint>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TypeConstraint {
-    BuiltIn(hir::BuiltinType),
-    Path(ast::Path),
+    Type(ast::Type),
+    /// This is what the Type variant gets turned into when we resolve rules in resolving.rs. Were
+    /// this to become a common pattern, we might want to split Constraint into two enums, the first
+    /// produced by parsing and the second produced by resolving. Currently however that would
+    /// require duplicating the other variants and writing code to copy those variants over, so it
+    /// doesn't seem worthwhile.
+    /// TODO: This should be hir:Type
+    ResolvedType(ast::Type),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -317,7 +318,7 @@ fn parse_constraint(tokens: &mut std::vec::IntoIter<Token>) -> Result<Constraint
             expect_token(tokens, "(")?;
             let contents = up_to_closing_parenthesis(tokens)?;
             if let Ok(type_ref) = ast::Type::parse(&contents) {
-                Ok(Constraint::Type(TypeConstraint::from_type_ref(&type_ref)?))
+                Ok(Constraint::Type(type_ref))
             } else {
                 bail!("Couldn't parse `{}` as a type reference", contents);
             }
@@ -362,32 +363,6 @@ fn up_to_closing_parenthesis(tokens: &mut std::vec::IntoIter<Token>) -> Result<S
         res.push_str(&token.text);
     }
     Ok(res)
-}
-
-impl TypeConstraint {
-    fn from_type_ref(ty: &ast::Type) -> Result<Self, SsrError> {
-        match ty {
-            ast::Type::PathType(path_type) => {
-                if let Some(path) = path_type.path() {
-                    if path.parent_path().is_none() {
-                        if let Some(segment) = path.segment() {
-                            if let Some(name_ref) = segment.name_ref() {
-                                for (builtin_name, builtin) in hir::BuiltinType::ALL {
-                                    if builtin_name.to_string() == name_ref.text().as_str() {
-                                        return Ok(TypeConstraint::BuiltIn(builtin.clone()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    return Ok(TypeConstraint::Path(path));
-                } else {
-                    bail!("Invalid PathType");
-                }
-            }
-            _ => bail!("Unsupported type in type constraint"),
-        }
-    }
 }
 
 fn expect_token(tokens: &mut std::vec::IntoIter<Token>, expected: &str) -> Result<(), SsrError> {

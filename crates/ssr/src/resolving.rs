@@ -22,7 +22,7 @@ pub(crate) struct ResolvedRule {
 pub(crate) struct ResolvedPattern {
     pub(crate) placeholders_by_stand_in: FxHashMap<SmolStr, parsing::Placeholder>,
     pub(crate) node: SyntaxNode,
-    // Paths in `node` that we've resolved.
+    /// Paths in `node` that we've resolved.
     pub(crate) resolved_paths: FxHashMap<SyntaxNode, ResolvedPath>,
     pub(crate) ufcs_function_calls: FxHashMap<SyntaxNode, UfcsCallInfo>,
     pub(crate) contains_self: bool,
@@ -106,7 +106,7 @@ impl Resolver<'_, '_> {
         Ok(ResolvedPattern {
             node: pattern,
             resolved_paths,
-            placeholders_by_stand_in: self.placeholders_by_stand_in.clone(),
+            placeholders_by_stand_in: self.resolved_placeholders(),
             ufcs_function_calls,
             contains_self,
         })
@@ -144,6 +144,27 @@ impl Resolver<'_, '_> {
             self.resolve(node, depth + 1, resolved_paths)?;
         }
         Ok(())
+    }
+
+    /// Returns placeholders with any required resolution performed. In particular, types in type
+    /// constraints will have been converted to ResolvedType.
+    fn resolved_placeholders(&self) -> FxHashMap<SmolStr, parsing::Placeholder> {
+        self.placeholders_by_stand_in
+            .clone()
+            .into_iter()
+            .map(|(k, placeholder)| (k, self.resolve_placeholder(placeholder)))
+            .collect()
+    }
+
+    fn resolve_placeholder(&self, mut placeholder: parsing::Placeholder) -> parsing::Placeholder {
+        for constraint in &mut placeholder.constraints {
+            if let parsing::Constraint::Type(ast_type) = constraint {
+                // TODO: Resolve the HIR type here. This might be in the form of a new method
+                // `SemanticsScope.speculative_resolve_type`.
+                *constraint = parsing::Constraint::ResolvedType(ast_type.clone())
+            }
+        }
+        placeholder
     }
 
     /// Returns whether `path` contains a placeholder, but ignores any placeholders within type
